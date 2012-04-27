@@ -67,7 +67,173 @@ class DeclarativeFieldsMetaclass(type):
             new_class.media = media_property(new_class)
         return new_class
 
+class BoundField(StrAndUnicode):
+    "A Field plus data"
+    def __init__(self, form, field, name):
+        self.form = form
+        self.field = field
+        self.name = name
+        self.html_name = form.add_prefix(name)
+        self.html_initial_name = form.add_initial_prefix(name)
+        self.html_initial_id = form.add_initial_prefix(self.auto_id)
+        if self.field.label is None:
+            self.label = pretty_name(name)
+        else:
+            self.label = self.field.label
+        self.help_text = field.help_text or ''
+
+    def __unicode__(self):
+        """Renders this field as an HTML widget."""
+        if self.field.show_hidden_initial:
+            return self.as_widget() + self.as_hidden(only_initial=True)
+        return self.as_widget()
+
+    def __iter__(self):
+        """
+        Yields rendered strings that comprise all widgets in this BoundField.
+
+        This really is only useful for RadioSelect widgets, so that you can
+        iterate over individual radio buttons in a template.
+        """
+        for subwidget in self.field.widget.subwidgets(self.html_name, self.value()):
+            yield subwidget
+
+    def __len__(self):
+        return len(list(self.__iter__()))
+
+    def __getitem__(self, idx):
+        return list(self.__iter__())[idx]
+
+    def _errors(self):
+        """
+        Returns an ErrorList for this field. Returns an empty ErrorList
+        if there are none.
+        """
+        return self.form.errors.get(self.name, self.form.error_class())
+    errors = property(_errors)
+
+    def as_widget(self, widget=None, attrs=None, only_initial=False):
+        """
+        Renders the field by rendering the passed widget, adding any HTML
+        attributes passed as attrs.  If no widget is specified, then the
+        field's default widget will be used.
+        """
+        if not widget:
+            widget = self.field.widget
+
+        attrs = attrs or {}
+        auto_id = self.auto_id
+        if auto_id and 'id' not in attrs and 'id' not in widget.attrs:
+            if not only_initial:
+                attrs['id'] = auto_id
+            else:
+                attrs['id'] = self.html_initial_id
+
+        if not only_initial:
+            name = self.html_name
+        else:
+            name = self.html_initial_name
+        return widget.render(name, self.value(), attrs=attrs)
+
+    def as_text(self, attrs=None, **kwargs):
+        """
+        Returns a string of HTML for representing this as an <input type="text">.
+        """
+        return self.as_widget(TextInput(), attrs, **kwargs)
+
+    def as_textarea(self, attrs=None, **kwargs):
+        "Returns a string of HTML for representing this as a <textarea>."
+        return self.as_widget(Textarea(), attrs, **kwargs)
+
+    def as_hidden(self, attrs=None, **kwargs):
+        """
+        Returns a string of HTML for representing this as an <input type="hidden">.
+        """
+        return self.as_widget(self.field.hidden_widget(), attrs, **kwargs)
+
+    def _data(self):
+        """
+        Returns the data for this BoundField, or None if it wasn't given.
+        """
+        return self.field.widget.value_from_datadict(self.form.data, self.form.files, self.html_name)
+    data = property(_data)
+
+    def value(self):
+        """
+        Returns the value for this BoundField, using the initial value if
+        the form is not bound or the data otherwise.
+        """
+        if not self.form.is_bound:
+            data = self.form.initial.get(self.name, self.field.initial)
+            if callable(data):
+                data = data()
+        else:
+            data = self.field.bound_data(
+                self.data, self.form.initial.get(self.name, self.field.initial)
+            )
+        return self.field.prepare_value(data)
+
+    def label_tag(self, contents=None, attrs=None):
+        """
+        Wraps the given contents in a <label>, if the field has an ID attribute.
+        Does not HTML-escape the contents. If contents aren't given, uses the
+        field's HTML-escaped label.
+
+        If attrs are given, they're used as HTML attributes on the <label> tag.
+        """
+        contents = contents or conditional_escape(self.label)
+        widget = self.field.widget
+        id_ = widget.attrs.get('id') or self.auto_id
+        if id_:
+            attrs = attrs and flatatt(attrs) or ''
+            contents = u'<label for="%s"%s>%s</label>' % (widget.id_for_label(id_), attrs, unicode(contents))
+        return mark_safe(contents)
+
+    def css_classes(self, extra_classes=None):
+        """
+        Returns a string of space-separated CSS classes for this field.
+        """
+        if hasattr(extra_classes, 'split'):
+            extra_classes = extra_classes.split()
+        extra_classes = set(extra_classes or [])
+        if self.errors and hasattr(self.form, 'error_css_class'):
+            extra_classes.add(self.form.error_css_class)
+        if self.field.required and hasattr(self.form, 'required_css_class'):
+            extra_classes.add(self.form.required_css_class)
+        return ' '.join(extra_classes)
+
+    def _is_hidden(self):
+        "Returns True if this BoundField's widget is hidden."
+        return self.field.widget.is_hidden
+    is_hidden = property(_is_hidden)
+
+    def _auto_id(self):
+        """
+        Calculates and returns the ID attribute for this BoundField, if the
+        associated Form has specified auto_id. Returns an empty string otherwise.
+        """
+        auto_id = self.form.auto_id
+        if auto_id and '%s' in smart_unicode(auto_id):
+            return smart_unicode(auto_id) % self.html_name
+        elif auto_id:
+            return self.html_name
+        return ''
+    auto_id = property(_auto_id)
+
+    def _id_for_label(self):
+        """
+        Wrapper around the field widget's `id_for_label` method.
+        Useful, for example, for focusing on this field regardless of whether
+        it has a single widget or a MutiWidget.
+        """
+        widget = self.field.widget
+        id_ = widget.attrs.get('id') or self.auto_id
+        return widget.id_for_label(id_)
+    id_for_label = property(_id_for_label)
+
+
 class BaseForm(StrAndUnicode):
+    _bound_field_class = BoundField
     # This is the main implementation of all the Form logic. Note that this
     # class is different than Form. See the comments by the Form class for more
     # information. Any improvements to the form API should be made to *this*
@@ -94,6 +260,7 @@ class BaseForm(StrAndUnicode):
         # self.base_fields.
         self.fields = copy.deepcopy(self.base_fields)
 
+
     def __unicode__(self):
         return self.as_table()
 
@@ -102,12 +269,12 @@ class BaseForm(StrAndUnicode):
             yield self[name]
 
     def __getitem__(self, name):
-        "Returns a BoundField with the given name."
+        "Returns a _bound_field_class with the given name."
         try:
             field = self.fields[name]
         except KeyError:
             raise KeyError('Key %r not found in Form' % name)
-        return BoundField(self, field, name)
+        return self._bound_field_class(self, field, name)
 
     def _get_errors(self):
         "Returns an ErrorDict for the data provided for the form"
@@ -389,166 +556,3 @@ class Form(BaseForm):
     # BaseForm itself has no way of designating self.fields.
     __metaclass__ = DeclarativeFieldsMetaclass
 
-class BoundField(StrAndUnicode):
-    "A Field plus data"
-    def __init__(self, form, field, name):
-        self.form = form
-        self.field = field
-        self.name = name
-        self.html_name = form.add_prefix(name)
-        self.html_initial_name = form.add_initial_prefix(name)
-        self.html_initial_id = form.add_initial_prefix(self.auto_id)
-        if self.field.label is None:
-            self.label = pretty_name(name)
-        else:
-            self.label = self.field.label
-        self.help_text = field.help_text or ''
-
-    def __unicode__(self):
-        """Renders this field as an HTML widget."""
-        if self.field.show_hidden_initial:
-            return self.as_widget() + self.as_hidden(only_initial=True)
-        return self.as_widget()
-
-    def __iter__(self):
-        """
-        Yields rendered strings that comprise all widgets in this BoundField.
-
-        This really is only useful for RadioSelect widgets, so that you can
-        iterate over individual radio buttons in a template.
-        """
-        for subwidget in self.field.widget.subwidgets(self.html_name, self.value()):
-            yield subwidget
-
-    def __len__(self):
-        return len(list(self.__iter__()))
-
-    def __getitem__(self, idx):
-        return list(self.__iter__())[idx]
-
-    def _errors(self):
-        """
-        Returns an ErrorList for this field. Returns an empty ErrorList
-        if there are none.
-        """
-        return self.form.errors.get(self.name, self.form.error_class())
-    errors = property(_errors)
-
-    def as_widget(self, widget=None, attrs=None, only_initial=False):
-        """
-        Renders the field by rendering the passed widget, adding any HTML
-        attributes passed as attrs.  If no widget is specified, then the
-        field's default widget will be used.
-        """
-        if not widget:
-            widget = self.field.widget
-
-        attrs = attrs or {}
-        auto_id = self.auto_id
-        if auto_id and 'id' not in attrs and 'id' not in widget.attrs:
-            if not only_initial:
-                attrs['id'] = auto_id
-            else:
-                attrs['id'] = self.html_initial_id
-
-        if not only_initial:
-            name = self.html_name
-        else:
-            name = self.html_initial_name
-        return widget.render(name, self.value(), attrs=attrs)
-
-    def as_text(self, attrs=None, **kwargs):
-        """
-        Returns a string of HTML for representing this as an <input type="text">.
-        """
-        return self.as_widget(TextInput(), attrs, **kwargs)
-
-    def as_textarea(self, attrs=None, **kwargs):
-        "Returns a string of HTML for representing this as a <textarea>."
-        return self.as_widget(Textarea(), attrs, **kwargs)
-
-    def as_hidden(self, attrs=None, **kwargs):
-        """
-        Returns a string of HTML for representing this as an <input type="hidden">.
-        """
-        return self.as_widget(self.field.hidden_widget(), attrs, **kwargs)
-
-    def _data(self):
-        """
-        Returns the data for this BoundField, or None if it wasn't given.
-        """
-        return self.field.widget.value_from_datadict(self.form.data, self.form.files, self.html_name)
-    data = property(_data)
-
-    def value(self):
-        """
-        Returns the value for this BoundField, using the initial value if
-        the form is not bound or the data otherwise.
-        """
-        if not self.form.is_bound:
-            data = self.form.initial.get(self.name, self.field.initial)
-            if callable(data):
-                data = data()
-        else:
-            data = self.field.bound_data(
-                self.data, self.form.initial.get(self.name, self.field.initial)
-            )
-        return self.field.prepare_value(data)
-
-    def label_tag(self, contents=None, attrs=None):
-        """
-        Wraps the given contents in a <label>, if the field has an ID attribute.
-        Does not HTML-escape the contents. If contents aren't given, uses the
-        field's HTML-escaped label.
-
-        If attrs are given, they're used as HTML attributes on the <label> tag.
-        """
-        contents = contents or conditional_escape(self.label)
-        widget = self.field.widget
-        id_ = widget.attrs.get('id') or self.auto_id
-        if id_:
-            attrs = attrs and flatatt(attrs) or ''
-            contents = u'<label for="%s"%s>%s</label>' % (widget.id_for_label(id_), attrs, unicode(contents))
-        return mark_safe(contents)
-
-    def css_classes(self, extra_classes=None):
-        """
-        Returns a string of space-separated CSS classes for this field.
-        """
-        if hasattr(extra_classes, 'split'):
-            extra_classes = extra_classes.split()
-        extra_classes = set(extra_classes or [])
-        if self.errors and hasattr(self.form, 'error_css_class'):
-            extra_classes.add(self.form.error_css_class)
-        if self.field.required and hasattr(self.form, 'required_css_class'):
-            extra_classes.add(self.form.required_css_class)
-        return ' '.join(extra_classes)
-
-    def _is_hidden(self):
-        "Returns True if this BoundField's widget is hidden."
-        return self.field.widget.is_hidden
-    is_hidden = property(_is_hidden)
-
-    def _auto_id(self):
-        """
-        Calculates and returns the ID attribute for this BoundField, if the
-        associated Form has specified auto_id. Returns an empty string otherwise.
-        """
-        auto_id = self.form.auto_id
-        if auto_id and '%s' in smart_unicode(auto_id):
-            return smart_unicode(auto_id) % self.html_name
-        elif auto_id:
-            return self.html_name
-        return ''
-    auto_id = property(_auto_id)
-
-    def _id_for_label(self):
-        """
-        Wrapper around the field widget's `id_for_label` method.
-        Useful, for example, for focusing on this field regardless of whether
-        it has a single widget or a MutiWidget.
-        """
-        widget = self.field.widget
-        id_ = widget.attrs.get('id') or self.auto_id
-        return widget.id_for_label(id_)
-    id_for_label = property(_id_for_label)
